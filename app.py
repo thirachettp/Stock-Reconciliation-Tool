@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import json
 import io
 import re
@@ -134,6 +135,8 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .kpi-match .kpi-value  { color:var(--kpi-match); }
 .kpi-mis .kpi-value    { color:var(--kpi-mismatch); }
 .kpi-miss .kpi-value   { color:var(--kpi-missing); }
+.kpi-missA .kpi-value  { color:var(--kpi-mismatch); }
+.kpi-missB .kpi-value  { color:#db2777; }
 
 /* ── Formula preview ── */
 .fpv {
@@ -216,7 +219,19 @@ details > summary { background:var(--bg-card); border-radius:8px; padding:8px 12
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-FUNCTIONS = ["FIRST", "SUM", "MIN", "MAX", "COUNT", "วดป", "ปดว", "ดวป"]
+FUNCTIONS = ["FIRST", "SUM", "SUMIF", "MIN", "MAX", "COUNT", "วดป", "ปดว", "ดวป"]
+
+# SUMIF operators — (internal code, display label). "is_blank"/"is_not_blank"
+# need no comparison value; the rest compare against either a typed-in
+# constant or another column's value (row-wise), depending on criteria_mode.
+SUMIF_OPERATORS = [
+    ("==", "="), ("!=", "≠"),
+    (">", ">"), ("<", "<"), (">=", "≥"), ("<=", "≤"),
+    ("contains", "มีคำว่า..."), ("not_contains", "ไม่มีคำว่า..."),
+    ("is_blank", "ว่าง (blank)"), ("is_not_blank", "ไม่ว่าง (not blank)"),
+]
+SUMIF_OP_CODES  = [c for c, _ in SUMIF_OPERATORS]
+SUMIF_OP_LABELS = dict(SUMIF_OPERATORS)
 
 # Three dedicated date-order functions for fields where the source date text
 # is genuinely ambiguous (e.g. '03/04/2026'). Unlike FIRST/MIN/MAX (which use
@@ -239,6 +254,10 @@ try:
 except Exception:
     pass  # older pandas versions don't have this option; safe to ignore
 SYSTEMS   = ["FC", "JDA", "MHT"]
+
+# Total uploaded bytes (per side) above which we warn the user — large
+# uploads sit in session_state for the whole session and can add up.
+FILE_SIZE_WARN_MB = 50
 
 DEFAULT_MAPPINGS = {
     "JDA": {
@@ -503,6 +522,51 @@ def _warn_unparseable_numeric(before, after, label):
         st.warning(f"⚠️ {label}: มี {n_bad} แถวที่ค่าไม่ใช่ตัวเลข (parse ไม่ได้) ถูกนับเป็น 0 โดยอัตโนมัติ")
     return n_bad
 
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return np.nan
+
+def _eval_sumif_mask(crit_series, operator, other, is_column_mode):
+    """
+    Row-wise SUMIF criteria mask. `other` is either a pandas Series (same
+    length as crit_series, when is_column_mode=True) or a scalar string
+    (when comparing against a typed-in constant).
+    """
+    cs = crit_series
+    if operator == "is_blank":
+        return cs.isna() | (cs.astype(str).str.strip() == "")
+    if operator == "is_not_blank":
+        return ~(cs.isna() | (cs.astype(str).str.strip() == ""))
+
+    if operator in ("==", "!="):
+        a = cs.astype(str).str.strip()
+        b = other.astype(str).str.strip() if is_column_mode else str(other).strip()
+        eq = (a == b)
+        return eq if operator == "==" else ~eq
+
+    if operator in (">", "<", ">=", "<="):
+        a = pd.to_numeric(cs, errors="coerce")
+        b = pd.to_numeric(other, errors="coerce") if is_column_mode else _safe_float(other)
+        if operator == ">":  return a > b
+        if operator == "<":  return a < b
+        if operator == ">=": return a >= b
+        return a <= b
+
+    if operator in ("contains", "not_contains"):
+        if is_column_mode:
+            needle = other.astype(str).str.lower()
+            hay = cs.astype(str).str.lower()
+            mask = pd.Series(
+                [(h.find(n) >= 0) for h, n in zip(hay, needle)], index=cs.index
+            )
+        else:
+            mask = cs.astype(str).str.contains(str(other), case=False, na=False, regex=False)
+        return mask if operator == "contains" else ~mask
+
+    return pd.Series(False, index=cs.index)
+
 def apply_formula(df, formula, date_format="auto"):
     fn   = formula["function"]
     cols = formula["columns"]
@@ -529,6 +593,32 @@ def apply_formula(df, formula, date_format="auto"):
         for c in valid:
             _warn_unparseable_numeric(sub[c], coerced[c], f"Target '{target}' ← คอลัมน์ '{c}'")
         return coerced.sum(axis=1).reset_index(drop=True)
+    elif fn == "SUMIF":
+        sum_col = valid[0] if valid else None
+        crit_col = formula.get("criteria_column")
+        operator = formula.get("operator", "==")
+        mode = formula.get("criteria_mode", "const")
+        crit_value = formula.get("criteria_value", "")
+        crit_col2 = formula.get("criteria_column2")
+
+        if sum_col is None or not crit_col or crit_col not in df.columns:
+            return pd.Series([None] * len(df), index=df.index)
+
+        df_r = df.reset_index(drop=True)
+        crit_series = df_r[crit_col]
+        sum_raw = df_r[sum_col]
+        sum_series = pd.to_numeric(sum_raw, errors="coerce")
+        _warn_unparseable_numeric(sum_raw, sum_series, f"Target '{target}' (SUMIF) ← คอลัมน์ '{sum_col}'")
+
+        if mode == "column" and crit_col2 and crit_col2 in df.columns:
+            mask = _eval_sumif_mask(crit_series, operator, df_r[crit_col2], True)
+        else:
+            mask = _eval_sumif_mask(crit_series, operator, crit_value, False)
+
+        # Rows that don't meet the criteria contribute 0 — same convention as
+        # SUM's non-numeric handling — so the later per-key groupby-sum in
+        # compare_tables adds up correctly.
+        return sum_series.where(mask.fillna(False), other=0.0).reset_index(drop=True)
     elif fn == "MIN":
         coerced = _coerce_for_minmax(sub, date_format=date_format)
         result = coerced.min(axis=1).reset_index(drop=True)
@@ -553,12 +643,22 @@ def build_standard(df, formulas, date_format="auto"):
             result[t] = apply_formula(df.reset_index(drop=True), f, date_format=fmt)
     return pd.DataFrame(result)
 
-def formula_preview_str(fn, cols):
+def formula_preview_str(fn, cols, side_cfg=None):
+    if fn == "SUMIF":
+        sum_col = cols[0] if cols else "?"
+        cfg = side_cfg or {}
+        crit_col = cfg.get("criteria_column") or "?"
+        operator = cfg.get("operator", "==")
+        op_label = SUMIF_OP_LABELS.get(operator, "=")
+        if operator in ("is_blank", "is_not_blank"):
+            return f"SUMIF({sum_col}, {crit_col} {op_label})"
+        val = cfg.get("criteria_column2") or "?" if cfg.get("criteria_mode") == "column" else (cfg.get("criteria_value") or "?")
+        return f"SUMIF({sum_col}, {crit_col} {op_label} {val})"
     if not cols:
         return f"{fn}(...)"
     return f"{fn}({', '.join(cols)})"
 
-def compare_tables(std_a, std_b, key_cols, compare_fields):
+def compare_tables(std_a, std_b, key_cols, compare_fields, fuzzy_keys=False):
     agg_a = std_a.copy()
     agg_b = std_b.copy()
 
@@ -621,6 +721,19 @@ def compare_tables(std_a, std_b, key_cols, compare_fields):
                 agg_a[k] = a_col.astype(str).where(a_col.notna(), None)
                 agg_b[k] = b_col.astype(str).where(b_col.notna(), None)
 
+    # Opt-in fuzzy matching: strip leading/trailing whitespace and ignore
+    # case when comparing string-valued keys. Off by default — exact match
+    # is usually what's wanted for SKU/Location codes. Only affects string
+    # values; numeric/date keys are untouched.
+    if fuzzy_keys:
+        def _norm(v):
+            return v.strip().casefold() if isinstance(v, str) else v
+        for k in key_cols:
+            if k in agg_a.columns:
+                agg_a[k] = agg_a[k].map(_norm)
+            if k in agg_b.columns:
+                agg_b[k] = agg_b[k].map(_norm)
+
     vk_a = [k for k in key_cols if k in agg_a.columns]
     vk_b = [k for k in key_cols if k in agg_b.columns]
 
@@ -641,53 +754,113 @@ def compare_tables(std_a, std_b, key_cols, compare_fields):
         return None
 
     merged = pd.merge(agg_a, agg_b, on=common_keys, how="outer", suffixes=("_A","_B"), indicator=True)
+    idx = merged.index
+    n = len(merged)
 
-    rows = []
-    for _, row in merged.iterrows():
-        r = {k: row.get(k) for k in common_keys}
-        ind = row["_merge"]
-        all_match = True
-        mismatched_fields = []
-        for f in compare_fields:
-            ca, cb = f"{f}_A", f"{f}_B"
-            va = row.get(ca) if ca in merged.columns else row.get(f)
-            vb = row.get(cb) if cb in merged.columns else row.get(f)
+    result_cols = {k: merged[k] for k in common_keys}
+    # One boolean "did this field mismatch" column per compare field —
+    # collected so Status/Mismatched-Fields can be derived across all
+    # fields at once instead of per-row.
+    mismatch_masks = {}
 
-            if f in date_fields:
-                da = va.date() if pd.notna(va) else None
-                db = vb.date() if pd.notna(vb) else None
-                r[f"{f}_A"] = da
-                r[f"{f}_B"] = db
-                diff = (da - db).days if (da is not None and db is not None) else None
-            else:
-                r[f"{f}_A"] = va
-                r[f"{f}_B"] = vb
-                try:
-                    a_num = float(va) if pd.notna(va) else 0.0
-                    b_num = float(vb) if pd.notna(vb) else 0.0
-                    diff = a_num - b_num
-                except:
-                    diff = None
+    for f in compare_fields:
+        ca, cb = f"{f}_A", f"{f}_B"
+        # If a compare field only exists on one side, pd.merge doesn't add
+        # a suffix — fall back to the bare column (same values feed both
+        # "sides"), matching the previous per-row lookup logic exactly.
+        va = merged[ca] if ca in merged.columns else merged.get(f, pd.Series(np.nan, index=idx))
+        vb = merged[cb] if cb in merged.columns else merged.get(f, pd.Series(np.nan, index=idx))
 
-            r[f"{f}_Diff"] = diff
-            if diff is None or diff != 0:
-                all_match = False
-                mismatched_fields.append(f)
-        if ind == "left_only":
-            r["Status"] = "Missing B"
-        elif ind == "right_only":
-            r["Status"] = "Missing A"
-        elif all_match:
-            r["Status"] = "Match"
+        if f in date_fields:
+            both_notna = va.notna() & vb.notna()
+            diff = pd.Series(np.where(both_notna, (va - vb).dt.days, np.nan), index=idx)
+            result_cols[f"{f}_A"] = va.dt.date
+            result_cols[f"{f}_B"] = vb.dt.date
+            mismatch_masks[f] = diff.isna() | (diff != 0)
         else:
-            r["Status"] = "Mismatch"
-        # Only meaningful when both sides have a row to compare — for
-        # Missing A/B, every field differs "because" the row itself is
-        # missing on one side, so listing them adds no information.
-        r["Mismatched Fields"] = ", ".join(mismatched_fields) if r["Status"] == "Mismatch" else ""
-        rows.append(r)
+            va_num = pd.to_numeric(va, errors="coerce")
+            vb_num = pd.to_numeric(vb, errors="coerce")
+            diff = va_num.fillna(0.0) - vb_num.fillna(0.0)
+            result_cols[f"{f}_A"] = va
+            result_cols[f"{f}_B"] = vb
+            mismatch_masks[f] = diff != 0
 
-    return pd.DataFrame(rows)
+        result_cols[f"{f}_Diff"] = diff
+
+    mismatch_df = pd.DataFrame(mismatch_masks, index=idx) if mismatch_masks else pd.DataFrame(index=idx)
+    any_mismatch = mismatch_df.any(axis=1) if not mismatch_df.empty else pd.Series(False, index=idx)
+
+    status = pd.Series("Match", index=idx, dtype=object)
+    status[any_mismatch] = "Mismatch"
+    status[merged["_merge"] == "left_only"] = "Missing B"
+    status[merged["_merge"] == "right_only"] = "Missing A"
+    result_cols["Status"] = status
+
+    # Only meaningful when both sides have a row to compare — for
+    # Missing A/B, every field differs "because" the row itself is
+    # missing on one side, so listing them adds no information.
+    mismatched_fields_col = pd.Series("", index=idx, dtype=object)
+    is_mismatch = status == "Mismatch"
+    if not mismatch_df.empty and is_mismatch.any():
+        sub = mismatch_df.loc[is_mismatch]
+        field_names = np.array(sub.columns)
+        joined = [", ".join(field_names[row]) for row in sub.to_numpy()]
+        mismatched_fields_col.loc[is_mismatch] = joined
+    result_cols["Mismatched Fields"] = mismatched_fields_col
+
+    return pd.DataFrame(result_cols, index=idx)
+
+def df_to_csv_bytes(df):
+    """CSV with BOM so Thai text opens correctly in Excel."""
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+SUMIF_EXTRA_KEYS = ["criteria_column", "operator", "criteria_mode", "criteria_value", "criteria_column2"]
+
+def _side_cfg_to_export(side_cfg):
+    out = {"function": side_cfg["function"], "columns": list(side_cfg["columns"])}
+    for k in SUMIF_EXTRA_KEYS:
+        if k in side_cfg:
+            out[k] = side_cfg[k]
+    return out
+
+def export_mapping_json():
+    payload = {
+        "sys_a": st.session_state.sys_a,
+        "sys_b": st.session_state.sys_b,
+        "formulas": [
+            {
+                "target": r.get("target", ""),
+                "a": _side_cfg_to_export(r["a"]),
+                "b": _side_cfg_to_export(r["b"]),
+            }
+            for r in st.session_state.formulas_unified
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+def import_mapping_json(file_bytes):
+    """Parse an exported mapping JSON into fresh Formula Builder rows (new
+    ids, so they don't collide with any existing widget keys). Columns that
+    don't exist in the currently-loaded files are simply not pre-selected —
+    formula_builder_unified already filters selections against avail_cols,
+    so an import for the "wrong" system/files degrades gracefully instead
+    of crashing."""
+    data = json.loads(file_bytes.decode("utf-8"))
+    new_rows = []
+    for f in data.get("formulas", []):
+        row = {"id": uuid.uuid4().hex[:8], "target": f.get("target", "")}
+        for side in ("a", "b"):
+            side_in = f.get(side, {})
+            side_out = {
+                "function": side_in.get("function", "FIRST"),
+                "columns": list(side_in.get("columns", [])),
+            }
+            for k in SUMIF_EXTRA_KEYS:
+                if k in side_in:
+                    side_out[k] = side_in[k]
+            row[side] = side_out
+        new_rows.append(row)
+    return new_rows, data.get("sys_a"), data.get("sys_b")
 
 def export_excel(result_df, compare_fields):
     output = io.BytesIO()
@@ -820,12 +993,79 @@ def formula_builder_unified(formulas_key, cols_a, cols_b, sys_a, sys_b, df_a=Non
                 side_cfg["function"] = fn
 
             with c[base + 1]:
-                if avail_cols:
+                if fn == "SUMIF":
+                    # Drop any selections that no longer exist in the currently
+                    # loaded file (e.g. after swapping/re-uploading a file).
+                    side_cfg["columns"] = [x for x in side_cfg.get("columns", []) if x in avail_cols]
+                    if side_cfg.get("criteria_column") not in avail_cols:
+                        side_cfg["criteria_column"] = None
+                    if side_cfg.get("criteria_column2") not in avail_cols:
+                        side_cfg["criteria_column2"] = None
+
+                    if not avail_cols:
+                        st.caption("อัปโหลดไฟล์ก่อน")
+                        selected = side_cfg["columns"]
+                    else:
+                        with st.popover("⚙️ ตั้งค่า SUMIF", use_container_width=True):
+                            cur_sum = side_cfg["columns"][0] if side_cfg["columns"] else avail_cols[0]
+                            sum_col = st.selectbox(
+                                "รวมคอลัมน์ (Sum)", avail_cols,
+                                index=avail_cols.index(cur_sum) if cur_sum in avail_cols else 0,
+                                key=f"{formulas_key}_sumifsum_{side_key}_{rid}"
+                            )
+                            side_cfg["columns"] = [sum_col]
+
+                            cur_crit = side_cfg.get("criteria_column")
+                            crit_col = st.selectbox(
+                                "เงื่อนไขคอลัมน์ (Criteria)", avail_cols,
+                                index=avail_cols.index(cur_crit) if cur_crit in avail_cols else 0,
+                                key=f"{formulas_key}_sumifcrit_{side_key}_{rid}"
+                            )
+                            side_cfg["criteria_column"] = crit_col
+
+                            op_labels = [lbl for _, lbl in SUMIF_OPERATORS]
+                            cur_op = side_cfg.get("operator", "==")
+                            op_choice = st.selectbox(
+                                "Operator", op_labels,
+                                index=SUMIF_OP_CODES.index(cur_op) if cur_op in SUMIF_OP_CODES else 0,
+                                key=f"{formulas_key}_sumifop_{side_key}_{rid}"
+                            )
+                            operator = SUMIF_OP_CODES[op_labels.index(op_choice)]
+                            side_cfg["operator"] = operator
+
+                            if operator in ("is_blank", "is_not_blank"):
+                                side_cfg["criteria_mode"] = "const"
+                                st.caption("ไม่ต้องระบุค่าเปรียบเทียบสำหรับเงื่อนไขนี้")
+                            else:
+                                cur_mode = side_cfg.get("criteria_mode", "const")
+                                mode_choice = st.radio(
+                                    "เทียบกับ", ["ค่าคงที่", "อีกคอลัมน์"],
+                                    index=0 if cur_mode == "const" else 1,
+                                    key=f"{formulas_key}_sumifmode_{side_key}_{rid}", horizontal=True
+                                )
+                                side_cfg["criteria_mode"] = "const" if mode_choice == "ค่าคงที่" else "column"
+
+                                if side_cfg["criteria_mode"] == "const":
+                                    side_cfg["criteria_value"] = st.text_input(
+                                        "ค่าที่เทียบ", value=side_cfg.get("criteria_value", ""),
+                                        key=f"{formulas_key}_sumifval_{side_key}_{rid}",
+                                        placeholder='เช่น GOOD หรือ 100'
+                                    )
+                                else:
+                                    cur_crit2 = side_cfg.get("criteria_column2")
+                                    side_cfg["criteria_column2"] = st.selectbox(
+                                        "คอลัมน์ที่เทียบด้วย", avail_cols,
+                                        index=avail_cols.index(cur_crit2) if cur_crit2 in avail_cols else 0,
+                                        key=f"{formulas_key}_sumifcrit2_{side_key}_{rid}"
+                                    )
+                        selected = side_cfg["columns"]
+                elif avail_cols:
                     safe_default = [x for x in side_cfg.get("columns", []) if x in avail_cols]
                     selected = st.multiselect(
                         "cols", avail_cols, default=safe_default,
                         key=f"{formulas_key}_cols_{side_key}_{rid}", label_visibility="collapsed"
                     )
+                    side_cfg["columns"] = selected
                 else:
                     raw = st.text_input(
                         "cols", value=",".join(side_cfg.get("columns", [])),
@@ -833,10 +1073,10 @@ def formula_builder_unified(formulas_key, cols_a, cols_b, sys_a, sys_b, df_a=Non
                         placeholder="COL1,COL2"
                     )
                     selected = [x.strip() for x in raw.split(",") if x.strip()]
-                side_cfg["columns"] = selected
+                    side_cfg["columns"] = selected
 
             with c[base + 2]:
-                prev = formula_preview_str(fn, selected)
+                prev = formula_preview_str(fn, selected, side_cfg if fn == "SUMIF" else None)
                 st.markdown(f'<div class="fpv">{prev}</div>', unsafe_allow_html=True)
 
             row[side_key] = side_cfg
@@ -937,6 +1177,22 @@ def swap_a_and_b():
     s.compare_result = None
 
 # ─────────────────────────────────────────────
+# RESET / CLEAR SESSION
+# ─────────────────────────────────────────────
+def reset_all_session():
+    """
+    Wipe every piece of session state — uploaded files, formulas/mapping,
+    standard tables, compare results, and any per-widget keys (formula
+    builder rows, file-uploader selections, etc.) — then reinitialize back
+    to a fresh app. Lets the user start a new comparison without having to
+    refresh the browser tab.
+    """
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    init_state()
+    ensure_formulas_unified()
+
+# ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
 tab_upload, tab_formula, tab_compare = st.tabs([
@@ -1019,6 +1275,13 @@ def render_upload_side(side_code, sys_key, configs_key, df_key, uploader_key, co
 
     configs = st.session_state[configs_key]
     if configs:
+        total_mb = sum(len(cfg["bytes"]) for cfg in configs.values()) / (1024 * 1024)
+        if total_mb > FILE_SIZE_WARN_MB:
+            st.warning(
+                f"⚠️ ไฟล์ฝั่ง {side_code} รวมกันขนาด {total_mb:,.1f} MB "
+                f"(เกิน {FILE_SIZE_WARN_MB} MB) — ไฟล์จะถูกเก็บไว้ใน session ตลอด "
+                "จนกว่าจะ Reset ซึ่งอาจทำให้แอปช้าหรือใช้ memory มาก"
+            )
         for fkey, cfg in configs.items():
             n_sheets = len(cfg["sheets"])
             title = f"📄 {cfg['filename']}" + (f" ({n_sheets} sheets)" if cfg["is_excel"] and n_sheets > 1 else "")
@@ -1078,20 +1341,36 @@ def render_upload_side(side_code, sys_key, configs_key, df_key, uploader_key, co
         st.success(f"✅ {display_name} พร้อมใช้งาน — {len(df):,} rows × {len(df.columns)} columns")
         with st.expander("Preview 10 rows"):
             st.dataframe(df.head(10), use_container_width=True)
+        st.download_button(
+            f"📥 Export ข้อมูลดิบ {side_code} (CSV)", data=df_to_csv_bytes(df),
+            file_name=f"Raw_{side_code}_{datetime.now():%d%m%y_%H%M}.csv",
+            mime="text/csv", use_container_width=True,
+            key=f"export_raw_{side_code}",
+            help="ดาวน์โหลดข้อมูลดิบที่รวมไฟล์แล้ว (ก่อนผ่าน Formula Builder) ไว้เช็คย้อนกลับ",
+        )
 
 # ═══════════════════════════════════════════════
 # TAB 1 — UPLOAD
 # ═══════════════════════════════════════════════
 with tab_upload:
-    hdr_l, hdr_r = st.columns([5, 1])
+    hdr_l, hdr_r = st.columns([4.3, 1.7])
     with hdr_l:
         st.markdown('<div class="sec-title">Upload Source Files</div>', unsafe_allow_html=True)
         st.markdown('<div class="sec-sub">อัปโหลดไฟล์เดียวจะรวมให้อัตโนมัติ — ถ้ามีหลายไฟล์/หลาย Sheet/Header ไม่ได้อยู่แถวแรก ค่อยกด "รวมไฟล์" เอง</div>', unsafe_allow_html=True)
     with hdr_r:
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        if st.button("🔄 สลับ A ↔ B", use_container_width=True, help="สลับข้อมูล/ระบบ/ไฟล์ระหว่าง A และ B ทั้งหมด"):
-            swap_a_and_b()
-            st.rerun()
+        br1, br2 = st.columns(2)
+        with br1:
+            if st.button("🔄 สลับ A ↔ B", use_container_width=True, help="สลับข้อมูล/ระบบ/ไฟล์ระหว่าง A และ B ทั้งหมด"):
+                swap_a_and_b()
+                st.rerun()
+        with br2:
+            with st.popover("🗑 Reset ทั้งหมด", use_container_width=True, help="ล้างไฟล์ที่อัปโหลด, Mapping, และผลลัพธ์ทั้งหมด เริ่มใหม่ตั้งแต่ต้น"):
+                st.write("ล้างไฟล์ที่อัปโหลด, Mapping ทั้งหมด และผลลัพธ์ Compare — เริ่มต้นแอปใหม่ทั้งหมด")
+                st.caption("การกระทำนี้ไม่สามารถย้อนกลับได้")
+                if st.button("⚠️ ยืนยัน Reset ทั้งหมด", type="primary", use_container_width=True):
+                    reset_all_session()
+                    st.rerun()
 
     col_a, col_b = st.columns(2)
 
@@ -1141,6 +1420,47 @@ with tab_formula:
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # ── Save / Load Mapping ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-label">💾 Save / Load Mapping</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sec-sub" style="margin-bottom:12px;">'
+        'เก็บ Target Field / Function / Source Columns ไว้เป็นไฟล์ JSON เพื่อใช้ซ้ำครั้งหน้า '
+        '(ไม่ต้องตั้งค่าใหม่ทุกรอบสำหรับงาน reconciliation ที่ทำเป็นประจำ)</div>',
+        unsafe_allow_html=True
+    )
+    mcol1, mcol2 = st.columns(2)
+    with mcol1:
+        st.download_button(
+            "📤 Export Mapping (JSON)", data=export_mapping_json(),
+            file_name=f"Mapping_{st.session_state.sys_a}_{st.session_state.sys_b}_{datetime.now():%d%m%y_%H%M}.json",
+            mime="application/json", use_container_width=True,
+        )
+    with mcol2:
+        uploaded_mapping = st.file_uploader(
+            "Import Mapping", type=["json"], key="mapping_uploader",
+            label_visibility="collapsed", help="อัปโหลดไฟล์ Mapping ที่เคย Export ไว้"
+        )
+        if uploaded_mapping is not None:
+            if st.button("📥 นำเข้า Mapping นี้", use_container_width=True, key="apply_mapping_btn"):
+                try:
+                    new_rows, imp_sys_a, imp_sys_b = import_mapping_json(uploaded_mapping.getvalue())
+                    if not new_rows:
+                        st.warning("ไฟล์นี้ไม่มี Target Field ให้นำเข้า")
+                    else:
+                        st.session_state.formulas_unified = new_rows
+                        st.session_state.std_a = None
+                        st.session_state.std_b = None
+                        st.session_state.compare_result = None
+                        note = ""
+                        if imp_sys_a and imp_sys_b and (imp_sys_a != st.session_state.sys_a or imp_sys_b != st.session_state.sys_b):
+                            note = f" (Mapping นี้ Export ไว้ตอนระบบเป็น {imp_sys_a}/{imp_sys_b} — ชื่อคอลัมน์ที่ไม่ตรงกับไฟล์ปัจจุบันจะไม่ถูกเลือกไว้ล่วงหน้า ตรวจสอบอีกครั้งด้านบน)"
+                        st.success(f"✅ นำเข้า Mapping สำเร็จ — {len(new_rows)} target fields{note}")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"นำเข้าไม่สำเร็จ — ไฟล์ไม่ใช่ Mapping JSON ที่ถูกต้อง: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
+
     # ── Build ──
     st.markdown("<hr class='s'>", unsafe_allow_html=True)
 
@@ -1159,11 +1479,11 @@ with tab_formula:
         else:
             with st.spinner("กำลัง Build..."):
                 st.session_state.formulas_a = [
-                    {"target": r["target"], "function": r["a"]["function"], "columns": r["a"]["columns"]}
+                    {"target": r["target"], **r["a"]}
                     for r in st.session_state.formulas_unified if r.get("target","").strip()
                 ]
                 st.session_state.formulas_b = [
-                    {"target": r["target"], "function": r["b"]["function"], "columns": r["b"]["columns"]}
+                    {"target": r["target"], **r["b"]}
                     for r in st.session_state.formulas_unified if r.get("target","").strip()
                 ]
                 st.session_state.std_a = build_standard(st.session_state.df_a_raw, st.session_state.formulas_a)
@@ -1178,9 +1498,19 @@ with tab_formula:
         with p1:
             st.markdown(f'<div class="card-label" style="margin-top:16px">Standard Table {tag_a} — {len(st.session_state.std_a):,} rows</div>', unsafe_allow_html=True)
             st.dataframe(st.session_state.std_a, use_container_width=True, height=400)
+            st.download_button(
+                f"📥 Export Standard Table {tag_a} (CSV)", data=df_to_csv_bytes(st.session_state.std_a),
+                file_name=f"Standard_{tag_a}_{datetime.now():%d%m%y_%H%M}.csv",
+                mime="text/csv", use_container_width=True, key="export_std_a",
+            )
         with p2:
             st.markdown(f'<div class="card-label" style="margin-top:16px">Standard Table {tag_b} — {len(st.session_state.std_b):,} rows</div>', unsafe_allow_html=True)
             st.dataframe(st.session_state.std_b, use_container_width=True, height=400)
+            st.download_button(
+                f"📥 Export Standard Table {tag_b} (CSV)", data=df_to_csv_bytes(st.session_state.std_b),
+                file_name=f"Standard_{tag_b}_{datetime.now():%d%m%y_%H%M}.csv",
+                mime="text/csv", use_container_width=True, key="export_std_b",
+            )
 
 # ═══════════════════════════════════════════════
 # TAB 3 — COMPARE
