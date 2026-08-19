@@ -12,7 +12,7 @@ from openpyxl.utils import get_column_letter
 # PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Stock Reconciliation Tool",
+    page_title="Reconciliation Tool",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="collapsed",
