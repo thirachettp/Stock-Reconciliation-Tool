@@ -228,6 +228,8 @@ SUMIF_OPERATORS = [
     ("==", "="), ("!=", "≠"),
     (">", ">"), ("<", "<"), (">=", "≥"), ("<=", "≤"),
     ("contains", "มีคำว่า..."), ("not_contains", "ไม่มีคำว่า..."),
+    ("in_list", "อยู่ในกลุ่ม (IN) — เลือกได้หลายค่า"),
+    ("not_in_list", "ไม่อยู่ในกลุ่ม (NOT IN)"),
     ("is_blank", "ว่าง (blank)"), ("is_not_blank", "ไม่ว่าง (not blank)"),
 ]
 SUMIF_OP_CODES  = [c for c, _ in SUMIF_OPERATORS]
@@ -567,6 +569,15 @@ def _eval_sumif_mask(crit_series, operator, other, is_column_mode):
 
     return pd.Series(False, index=cs.index)
 
+def _eval_sumif_list_mask(crit_series, values_list, negate=False):
+    """IN / NOT IN — row's criteria value matches any of several allowed
+    values (e.g. Status is A, B, or C). Comparison is exact-match on the
+    stripped string form, same convention as '=='/'!=' above."""
+    values_set = {str(v).strip() for v in values_list}
+    a = crit_series.astype(str).str.strip()
+    mask = a.isin(values_set)
+    return ~mask if negate else mask
+
 def apply_formula(df, formula, date_format="auto"):
     fn   = formula["function"]
     cols = formula["columns"]
@@ -600,6 +611,7 @@ def apply_formula(df, formula, date_format="auto"):
         mode = formula.get("criteria_mode", "const")
         crit_value = formula.get("criteria_value", "")
         crit_col2 = formula.get("criteria_column2")
+        crit_values_list = formula.get("criteria_values", [])
 
         if sum_col is None or not crit_col or crit_col not in df.columns:
             return pd.Series([None] * len(df), index=df.index)
@@ -610,7 +622,9 @@ def apply_formula(df, formula, date_format="auto"):
         sum_series = pd.to_numeric(sum_raw, errors="coerce")
         _warn_unparseable_numeric(sum_raw, sum_series, f"Target '{target}' (SUMIF) ← คอลัมน์ '{sum_col}'")
 
-        if mode == "column" and crit_col2 and crit_col2 in df.columns:
+        if operator in ("in_list", "not_in_list"):
+            mask = _eval_sumif_list_mask(crit_series, crit_values_list, negate=(operator == "not_in_list"))
+        elif mode == "column" and crit_col2 and crit_col2 in df.columns:
             mask = _eval_sumif_mask(crit_series, operator, df_r[crit_col2], True)
         else:
             mask = _eval_sumif_mask(crit_series, operator, crit_value, False)
@@ -652,6 +666,10 @@ def formula_preview_str(fn, cols, side_cfg=None):
         op_label = SUMIF_OP_LABELS.get(operator, "=")
         if operator in ("is_blank", "is_not_blank"):
             return f"SUMIF({sum_col}, {crit_col} {op_label})"
+        if operator in ("in_list", "not_in_list"):
+            vals = cfg.get("criteria_values", [])
+            vals_str = ", ".join(vals[:3]) + ("..." if len(vals) > 3 else "") if vals else "?"
+            return f"SUMIF({sum_col}, {crit_col} {op_label} [{vals_str}])"
         val = cfg.get("criteria_column2") or "?" if cfg.get("criteria_mode") == "column" else (cfg.get("criteria_value") or "?")
         return f"SUMIF({sum_col}, {crit_col} {op_label} {val})"
     if not cols:
@@ -814,7 +832,7 @@ def df_to_csv_bytes(df):
     """CSV with BOM so Thai text opens correctly in Excel."""
     return df.to_csv(index=False).encode("utf-8-sig")
 
-SUMIF_EXTRA_KEYS = ["criteria_column", "operator", "criteria_mode", "criteria_value", "criteria_column2"]
+SUMIF_EXTRA_KEYS = ["criteria_column", "operator", "criteria_mode", "criteria_value", "criteria_column2", "criteria_values"]
 
 def _side_cfg_to_export(side_cfg):
     out = {"function": side_cfg["function"], "columns": list(side_cfg["columns"])}
@@ -1036,6 +1054,31 @@ def formula_builder_unified(formulas_key, cols_a, cols_b, sys_a, sys_b, df_a=Non
                             if operator in ("is_blank", "is_not_blank"):
                                 side_cfg["criteria_mode"] = "const"
                                 st.caption("ไม่ต้องระบุค่าเปรียบเทียบสำหรับเงื่อนไขนี้")
+                            elif operator in ("in_list", "not_in_list"):
+                                side_cfg["criteria_mode"] = "const"
+                                df_side = df_a if side_key == "a" else df_b
+                                uniq_vals = []
+                                if df_side is not None and crit_col in df_side.columns:
+                                    raw_uniques = df_side[crit_col].dropna().unique()
+                                    if len(raw_uniques) <= 200:
+                                        uniq_vals = sorted({str(v) for v in raw_uniques})
+                                if uniq_vals:
+                                    side_cfg["criteria_values"] = st.multiselect(
+                                        "ค่าที่อยู่ในกลุ่ม (เลือกได้หลายค่า จากข้อมูลจริงในคอลัมน์นี้)",
+                                        uniq_vals,
+                                        default=[v for v in side_cfg.get("criteria_values", []) if v in uniq_vals],
+                                        key=f"{formulas_key}_sumifvals_{side_key}_{rid}"
+                                    )
+                                else:
+                                    if df_side is not None and crit_col in df_side.columns:
+                                        st.caption("คอลัมน์นี้มีค่าไม่ซ้ำเกิน 200 ค่า — พิมพ์เองแทน (คั่นด้วย comma)")
+                                    raw_vals = st.text_input(
+                                        "ค่าที่อยู่ในกลุ่ม (คั่นด้วย comma)",
+                                        value=",".join(side_cfg.get("criteria_values", [])),
+                                        key=f"{formulas_key}_sumifvalstxt_{side_key}_{rid}",
+                                        placeholder="เช่น A,B,C"
+                                    )
+                                    side_cfg["criteria_values"] = [x.strip() for x in raw_vals.split(",") if x.strip()]
                             else:
                                 cur_mode = side_cfg.get("criteria_mode", "const")
                                 mode_choice = st.radio(
